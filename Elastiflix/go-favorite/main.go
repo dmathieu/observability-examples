@@ -1,50 +1,18 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
+	"log/slog"
+	"math/rand"
 	"net/http"
 	"os"
+	"strconv"
 	"time"
 
 	"github.com/go-redis/redis/v8"
-
-	"github.com/sirupsen/logrus"
-
-	"github.com/gin-gonic/gin"
-	"strconv"
-	"math/rand"
 )
-
-var logger = &logrus.Logger{
-	Out:   os.Stderr,
-	Hooks: make(logrus.LevelHooks),
-	Level: logrus.InfoLevel,
-	Formatter: &logrus.JSONFormatter{
-		FieldMap: logrus.FieldMap{
-			logrus.FieldKeyTime:  "@timestamp",
-			logrus.FieldKeyLevel: "log.level",
-			logrus.FieldKeyMsg:   "message",
-			logrus.FieldKeyFunc:  "function.name", // non-ECS
-		},
-		TimestampFormat: time.RFC3339Nano,
-	},
-}
-
-func contextLogger(c *gin.Context) logrus.FieldLogger {
-	return logger
-}
-
-func logrusMiddleware(c *gin.Context) {
-	start := time.Now()
-	method := c.Request.Method
-	path := c.Request.URL.Path
-	if rawQuery := c.Request.URL.RawQuery; rawQuery != "" {
-		path += "?" + rawQuery
-	}
-	c.Next()
-	status := c.Writer.Status()
-	contextLogger(c).Infof("%s %s %d %s", method, path, status, time.Since(start))
-}
 
 func main() {
 	delayTime, _ := strconv.Atoi(os.Getenv("TOGGLE_SERVICE_DELAY"))
@@ -72,74 +40,82 @@ func main() {
 	})
 
 	// Initialize router
-	r := gin.New()
-	r.Use(logrusMiddleware)
+	mux := http.NewServeMux()
 
 	// Define routes
-	r.GET("/", func(c *gin.Context) {
-		contextLogger(c).Infof("Main request successful")
-		c.String(http.StatusOK, "Hello World!")
+	mux.HandleFunc("/", func(w http.ResponseWriter, req *http.Request) {
+		slog.Info("Main request successful")
+		fmt.Fprintf(w, "Hello World!")
 	})
 
-	r.GET("/favorites", func(c *gin.Context) {
+	mux.HandleFunc("GET /favorites", func(w http.ResponseWriter, req *http.Request) {
 		// artificial sleep for delayTime
 		time.Sleep(time.Duration(delayTime) * time.Millisecond)
 
-		userID := c.Query("user_id")
+		userID := req.URL.Query().Get("user_id")
 
-		contextLogger(c).Infof("Getting favorites for user %q", userID)
+		slog.Info("Getting favorites", "user", userID)
 
-		favorites, err := rdb.SMembers(c.Request.Context(), userID).Result()
+		favorites, err := rdb.SMembers(req.Context(), userID).Result()
 		if err != nil {
-			contextLogger(c).Error("Failed to get favorites for user %q", userID)
-			c.String(http.StatusInternalServerError, "Failed to get favorites")
+			slog.Error("Failed to get favorites", "user", userID)
+
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Failed to get favorites")
 			return
 		}
 
-		contextLogger(c).Infof("User %q has favorites %q", userID, favorites)
-
-		c.JSON(http.StatusOK, gin.H{
+		slog.Info("Found favorites", "user", userID, "favorites", favorites)
+		err = json.NewEncoder(w).Encode(map[string]any{
 			"favorites": favorites,
 		})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Failed to encode favorites")
+		}
 	})
 
-	r.POST("/favorites", func(c *gin.Context) {
+	mux.HandleFunc("POST /favorites", func(w http.ResponseWriter, req *http.Request) {
 		// artificial sleep for delayTime
 		time.Sleep(time.Duration(delayTime) * time.Millisecond)
 
-		userID := c.Query("user_id")
+		userID := req.URL.Query().Get("user_id")
 
-		contextLogger(c).Infof("Adding or removing favorites for user %q", userID)
+		slog.Info("Adding or removing favorites", "user", userID)
 
 		var data struct {
 			ID int `json:"id"`
 		}
-		if err := c.BindJSON(&data); err != nil {
-			contextLogger(c).Error("Failed to decode request body for user %q", userID)
-			c.String(http.StatusBadRequest, "Failed to decode request body")
+		err := json.NewDecoder(req.Body).Decode(&data)
+		if err != nil {
+			slog.Error("Failed to decode request body", "user", userID)
+			w.WriteHeader(http.StatusBadRequest)
+			fmt.Fprintf(w, "Failed to decode request body")
 			return
 		}
 
-		redisResponse := rdb.SRem(c.Request.Context(), userID, data.ID)
+		redisResponse := rdb.SRem(req.Context(), userID, data.ID)
 		if redisResponse.Err() != nil {
-			contextLogger(c).Error("Failed to remove movie from favorites for user %q", userID)
-			c.String(http.StatusInternalServerError, "Failed to remove movie from favorites")
+			slog.Error("Failed to remove movie from favorites", "user", userID)
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Failed to remove movie from favorites")
 			return
 		}
 
 		if redisResponse.Val() == 0 {
-			rdb.SAdd(c.Request.Context(), userID, data.ID)
+			rdb.SAdd(req.Context(), userID, data.ID)
 		}
 
-		favorites, err := rdb.SMembers(c.Request.Context(), userID).Result()
-		contextLogger(c).Infof("Getting favorites for user")
+		favorites, err := rdb.SMembers(req.Context(), userID).Result()
+		slog.Info("Getting favorites", "user", userID)
 		if err != nil {
-			contextLogger(c).Error("Failed to get favorites for user %q", userID)
-			c.String(http.StatusInternalServerError, "Failed to get favorites")
+			slog.Error("Failed to get favorites", "user", userID)
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Failed to get favorites")
 			return
 		}
 
-		contextLogger(c).Infof("User %q has favorites %q", userID, favorites)
+		slog.Info("Found favorites", "user", userID, "favorites", favorites)
 
 		// if enabled, in 50% of the cases, sleep for 2 seconds
 		sleepTimeStr := os.Getenv("TOGGLE_CANARY_DELAY")
@@ -149,9 +125,9 @@ func main() {
 		}
 
 		if sleepTime > 0 && rand.Float64() < 0.5 {
-			time.Sleep(time.Duration(rand.NormFloat64()*float64(sleepTime / 10)+float64(sleepTime))* time.Millisecond)
+			time.Sleep(time.Duration(rand.NormFloat64()*float64(sleepTime/10)+float64(sleepTime)) * time.Millisecond)
 			// add label to transaction
-			logger.Info("Canary enabled")
+			slog.Info("Canary enabled")
 
 			// read env var TOGGLE_CANARY_FAILURE, which is a float between 0 and 1
 			if toggleCanaryFailureStr := os.Getenv("TOGGLE_CANARY_FAILURE"); toggleCanaryFailureStr != "" {
@@ -161,19 +137,23 @@ func main() {
 				}
 				if rand.Float64() < toggleCanaryFailure {
 					// throw an exception in 50% of the cases
-					logger.Error("Something went wrong")
+					slog.Error("Something went wrong")
 					panic("Something went wrong")
 				}
 			}
 		}
 
-		c.JSON(http.StatusOK, gin.H{
+		err = json.NewEncoder(w).Encode(map[string]any{
 			"favorites": favorites,
 		})
+		if err != nil {
+			w.WriteHeader(http.StatusInternalServerError)
+			fmt.Fprintf(w, "Failed to encode favorites")
+		}
 	})
 
 	// Start server
-	logger.Infof("App startup")
-	log.Fatal(http.ListenAndServe(":"+applicationPort, r))
-	logger.Infof("App stopped")
+	slog.Info("App startup")
+	log.Fatal(http.ListenAndServe(":"+applicationPort, mux))
+	slog.Info("App stopped")
 }
